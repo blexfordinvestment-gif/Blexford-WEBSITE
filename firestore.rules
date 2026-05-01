@@ -1,0 +1,124 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Primitives
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function isSignedIn() { return request.auth != null && request.auth.token.email_verified == true; }
+    function isAdmin() { return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'; }
+    function isStaff() { return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) && (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'staff' || get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'); }
+
+    // Validation Blueprints
+    function isValidUser(data) {
+      return data.keys().hasAll(['email', 'name', 'role', 'createdAt']) && data.keys().size() == 4
+             && data.email is string && data.email.size() <= 200
+             && data.name is string && data.name.size() <= 150
+             && data.role is string && (data.role == 'admin' || data.role == 'staff' || data.role == 'user')
+             && data.createdAt == request.time;
+    }
+
+    function isValidPost(data) {
+      return data.keys().hasAll(['title', 'content', 'authorId', 'authorName', 'status', 'createdAt', 'updatedAt']) && data.keys().size() == 7
+             && data.title is string && data.title.size() <= 200
+             && data.content is string && data.content.size() <= 50000
+             && data.authorId is string && data.authorId == request.auth.uid
+             && data.authorName is string && data.authorName.size() <= 150
+             && data.status is string && (data.status == 'draft' || data.status == 'published')
+             && data.createdAt == request.time
+             && data.updatedAt == request.time;
+    }
+
+    function isValidLead(data) {
+      return data.keys().hasAll(['name', 'email', 'phone', 'message', 'source', 'status', 'createdAt']) && data.keys().size() == 7
+             && data.name is string && data.name.size() <= 150
+             && data.email is string && data.email.size() <= 200
+             && data.phone is string && data.phone.size() <= 50
+             && data.message is string && data.message.size() <= 5000
+             && data.source is string && data.source.size() <= 100
+             && data.status is string && (data.status == 'new' || data.status == 'contacted' || data.status == 'qualified' || data.status == 'lost')
+             && data.createdAt == request.time;
+    }
+    
+    function isValidTestimonial(data) {
+      return data.keys().hasAll(['clientName', 'company', 'content', 'rating', 'isApproved', 'createdAt']) && data.keys().size() == 6
+             && data.clientName is string && data.clientName.size() <= 150
+             && data.company is string && data.company.size() <= 150
+             && data.content is string && data.content.size() <= 2000
+             && data.rating is number && data.rating >= 1 && data.rating <= 5
+             && data.isApproved is bool
+             && data.createdAt == request.time;
+    }
+
+    function isValidChat(data) {
+      return data.keys().hasAll(['userId', 'staffId', 'status', 'createdAt', 'updatedAt']) && data.keys().size() == 5
+             && data.userId is string && data.userId.size() <= 128
+             && data.staffId is string && data.staffId.size() <= 128
+             && data.status is string && (data.status == 'active' || data.status == 'closed')
+             && data.createdAt == request.time
+             && data.updatedAt == request.time;
+    }
+
+    function isValidChatMessage(data) {
+      return data.keys().hasAll(['senderId', 'senderName', 'text', 'createdAt']) && data.keys().size() == 4
+             && data.senderId is string && data.senderId == request.auth.uid
+             && data.senderName is string && data.senderName.size() <= 150
+             && data.text is string && data.text.size() <= 2000
+             && data.createdAt == request.time;
+    }
+
+    // Collections
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (userId == request.auth.uid || isStaff());
+      allow list: if isStaff();
+      allow create: if isValidId(userId) && userId == request.auth.uid && isValidUser(incoming()) && incoming().role == 'user'; // Only can create themselves as 'user' initially
+      allow update: if isValidId(userId) && (
+        (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['role', 'name'])) ||
+        (userId == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['name']))
+      );
+    }
+
+    match /posts/{postId} {
+      allow get: if isValidId(postId); // Anyone can read a post (if published or if admin, handled on list query)
+      allow list: if (existing().status == 'published') || isStaff();
+      allow create: if isValidId(postId) && isStaff() && isValidPost(incoming());
+      allow update: if isValidId(postId) && isStaff() && existing().authorId == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'content', 'status', 'updatedAt']) && incoming().updatedAt == request.time;
+      allow delete: if isValidId(postId) && isAdmin();
+    }
+
+    match /leads/{leadId} {
+      allow get: if isValidId(leadId) && isStaff();
+      allow list: if isStaff();
+      allow create: if isValidId(leadId) && isValidLead(incoming()); // Anonymous users can submit leads
+      allow update: if isValidId(leadId) && isStaff() && incoming().diff(existing()).affectedKeys().hasOnly(['status']);
+      allow delete: if isValidId(leadId) && isAdmin();
+    }
+
+    match /testimonials/{testimonialId} {
+      allow get: if isValidId(testimonialId);
+      allow list: if existing().isApproved == true || isStaff();
+      allow create: if isValidId(testimonialId) && isValidTestimonial(incoming()) && incoming().isApproved == false; // Users can submit, defaults to unapproved
+      allow update: if isValidId(testimonialId) && isStaff() && incoming().diff(existing()).affectedKeys().hasOnly(['isApproved']);
+      allow delete: if isValidId(testimonialId) && isAdmin();
+    }
+
+    match /chats/{chatId} {
+      allow get: if isValidId(chatId) && isSignedIn() && (existing().userId == request.auth.uid || isStaff());
+      allow list: if isSignedIn() && (existing().userId == request.auth.uid || isStaff());
+      allow create: if isValidId(chatId) && isSignedIn() && isValidChat(incoming()) && incoming().userId == request.auth.uid;
+      allow update: if isValidId(chatId) && isSignedIn() && (existing().userId == request.auth.uid || isStaff()) && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt', 'staffId']) && incoming().updatedAt == request.time;
+      
+      match /messages/{messageId} {
+        allow get: if isValidId(messageId) && isSignedIn() && (get(/databases/$(database)/documents/chats/$(chatId)).data.userId == request.auth.uid || isStaff());
+        allow list: if isSignedIn() && (get(/databases/$(database)/documents/chats/$(chatId)).data.userId == request.auth.uid || isStaff());
+        allow create: if isValidId(messageId) && isSignedIn() && (get(/databases/$(database)/documents/chats/$(chatId)).data.userId == request.auth.uid || isStaff()) && isValidChatMessage(incoming());
+      }
+    }
+  }
+}
